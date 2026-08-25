@@ -241,12 +241,20 @@ class Handler(SimpleHTTPRequestHandler):
             except Exception as error: self.send_json({"error":str(error)},400)
 
     def do_DELETE(self):
-        path=urlparse(self.path).path; match = re.fullmatch(r"/api/records/(\d+)", path); vag_match = re.fullmatch(r"/api/vag-updates/(\d+)", path); user=self.require_admin()
+        path=urlparse(self.path).path; match = re.fullmatch(r"/api/records/(\d+)", path); vag_match = re.fullmatch(r"/api/vag-updates/(\d+)", path); vag_attachment_match = re.fullmatch(r"/api/vag-updates/(\d+)/attachments/(\d+)", path); user=self.require_admin()
         if user and match:
             with db() as c: c.execute("DELETE FROM records WHERE id=?",(match[1],)); c.execute("DELETE FROM favorites WHERE record_id=?",(match[1],)); c.execute("DELETE FROM attachments WHERE record_id=?",(match[1],)); c.execute("DELETE FROM history WHERE record_id=?",(match[1],))
             self.send_json({"ok":True})
         elif user and vag_match:
             with db() as c: c.execute("DELETE FROM vag_attachments WHERE vag_update_id=?",(vag_match[1],)); c.execute("DELETE FROM vag_updates WHERE id=?",(vag_match[1],))
+            self.send_json({"ok":True})
+        elif user and vag_attachment_match:
+            with db() as c:
+                row = c.execute("SELECT path FROM vag_attachments WHERE id=? AND vag_update_id=?", (vag_attachment_match[2], vag_attachment_match[1])).fetchone()
+                if not row: raise ValueError("Pièce jointe introuvable.")
+                c.execute("DELETE FROM vag_attachments WHERE id=?", (vag_attachment_match[2],))
+            stored = UPLOADS / Path(row["path"]).name
+            if stored.exists(): stored.unlink()
             self.send_json({"ok":True})
 
 if __name__ == "__main__":
