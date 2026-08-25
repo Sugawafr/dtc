@@ -39,7 +39,7 @@ def setup():
 
 class Handler(SimpleHTTPRequestHandler):
     def end_headers(self):
-        self.send_header("Cache-Control", "no-store" if self.path.startswith("/api/") else "public, max-age=3600")
+        self.send_header("Cache-Control", "no-store")
         super().end_headers()
 
     def send_json(self, data, status=200, cookie=None):
