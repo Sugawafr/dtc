@@ -33,9 +33,14 @@ def setup():
         CREATE TABLE IF NOT EXISTS favorites (user_id INTEGER NOT NULL, record_id INTEGER NOT NULL, PRIMARY KEY(user_id,record_id));
         CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY, record_id INTEGER NOT NULL, user_id INTEGER, action TEXT NOT NULL, details TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS attachments (id INTEGER PRIMARY KEY, record_id INTEGER NOT NULL, path TEXT NOT NULL, filename TEXT NOT NULL, created_at INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS vag_updates (id INTEGER PRIMARY KEY, code TEXT NOT NULL UNIQUE, module TEXT NOT NULL, vehicle TEXT NOT NULL, reference TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS vag_attachments (id INTEGER PRIMARY KEY, vag_update_id INTEGER NOT NULL, path TEXT NOT NULL, filename TEXT NOT NULL, created_at INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS idx_records_type_system ON records(type, system);
         CREATE INDEX IF NOT EXISTS idx_history_record_time ON history(record_id, created_at DESC);
         """)
+        if not c.execute("SELECT 1 FROM vag_updates LIMIT 1").fetchone():
+            now=int(time.time())
+            c.executemany("INSERT INTO vag_updates(code,module,vehicle,reference,created_at,updated_at) VALUES(?,?,?,?,?,?)", [("1F69CE","SOBDM","Explorer","",now,now),("37D6","PCM","Connect","26-2076",now,now),("2K4R","GWM","Connect","26-2336",now,now)])
 
 class Handler(SimpleHTTPRequestHandler):
     def end_headers(self):
@@ -88,6 +93,28 @@ class Handler(SimpleHTTPRequestHandler):
         with db() as c: rows = c.execute("SELECT * FROM records ORDER BY type,code COLLATE NOCASE").fetchall()
         self.send_json({"records":[self.record_payload(row, uid) for row in rows], "user": dict(user) if user else None})
 
+    def vag_payload(self, row):
+        item = dict(row)
+        with db() as c:
+            item["attachments"] = [dict(x) for x in c.execute("SELECT id,path,filename FROM vag_attachments WHERE vag_update_id=? ORDER BY id DESC", (item["id"],))]
+        return item
+
+    def get_vag_updates(self):
+        with db() as c: rows = c.execute("SELECT * FROM vag_updates ORDER BY code COLLATE NOCASE").fetchall()
+        self.send_json({"updates":[self.vag_payload(row) for row in rows], "user":dict(self.user()) if self.user() else None})
+
+    def save_vag_update(self, data, update_id=None):
+        code = str(data.get("code", "")).strip().upper(); module = str(data.get("module", "")).strip(); vehicle = str(data.get("vehicle", "")).strip(); reference = str(data.get("reference", "")).strip()
+        if not code or not module or not vehicle: raise ValueError("Code, module et véhicule sont obligatoires.")
+        now = int(time.time())
+        with db() as c:
+            if update_id:
+                c.execute("UPDATE vag_updates SET code=?,module=?,vehicle=?,reference=?,updated_at=? WHERE id=?", (code,module,vehicle,reference,now,update_id))
+                if not c.total_changes: raise ValueError("Code VAG introuvable.")
+            else:
+                cur=c.execute("INSERT INTO vag_updates(code,module,vehicle,reference,created_at,updated_at) VALUES(?,?,?,?,?,?)", (code,module,vehicle,reference,now,now)); update_id=cur.lastrowid
+            return self.vag_payload(c.execute("SELECT * FROM vag_updates WHERE id=?", (update_id,)).fetchone())
+
     def save_record(self, data, user_id, record_id=None):
         kind = data.get("type", "dtc")
         if kind not in ("dtc", "incident"): raise ValueError("Type de référence invalide.")
@@ -112,6 +139,7 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/api/records": self.get_records()
+        elif path == "/api/vag-updates": self.get_vag_updates()
         elif path == "/api/me":
             user = self.user(); self.send_json(dict(user) if user else None)
         elif path == "/api/stats":
@@ -157,6 +185,8 @@ class Handler(SimpleHTTPRequestHandler):
                 self.get_records()
             elif path == "/api/records":
                 self.send_json(self.save_record(self.read_json(), None), 201)
+            elif path == "/api/vag-updates":
+                if self.require_admin(): self.send_json(self.save_vag_update(self.read_json()), 201)
             elif (match := re.fullmatch(r"/api/records/(\d+)/favorite", path)):
                 user = self.require_user()
                 if user:
@@ -174,20 +204,35 @@ class Handler(SimpleHTTPRequestHandler):
                     name=Path(item.filename or "document").name; stored=f"{uuid.uuid4().hex}_{name}"; (UPLOADS/stored).write_bytes(content)
                     with db() as c: c.execute("INSERT INTO attachments(record_id,path,filename,created_at) VALUES(?,?,?,?)", (match[1],f"/uploads/{stored}",name,int(time.time())))
                     self.add_history(match[1],user["id"],"Pièce jointe",name); self.send_json({"ok":True})
+            elif (match := re.fullmatch(r"/api/vag-updates/(\d+)/attachment", path)):
+                user = self.require_admin()
+                if user:
+                    form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD":"POST","CONTENT_TYPE":self.headers.get("Content-Type","")})
+                    item=form["file"]; content=item.file.read(8*1024*1024+1)
+                    if len(content)>8*1024*1024: raise ValueError("Fichier limité à 8 Mo.")
+                    name=Path(item.filename or "document").name; stored=f"vag_{uuid.uuid4().hex}_{name}"; (UPLOADS/stored).write_bytes(content)
+                    with db() as c: c.execute("INSERT INTO vag_attachments(vag_update_id,path,filename,created_at) VALUES(?,?,?,?)", (match[1],f"/uploads/{stored}",name,int(time.time())))
+                    self.send_json({"ok":True})
             else: self.send_error(404)
         except sqlite3.IntegrityError: self.send_json({"error":"Cette référence existe déjà."},400)
         except Exception as error: self.send_json({"error":str(error)},400)
 
     def do_PUT(self):
-        match = re.fullmatch(r"/api/records/(\d+)", urlparse(self.path).path); user=self.require_admin()
+        path=urlparse(self.path).path; match = re.fullmatch(r"/api/records/(\d+)", path); vag_match = re.fullmatch(r"/api/vag-updates/(\d+)", path); user=self.require_admin()
         if user and match:
             try: self.send_json(self.save_record(self.read_json(),user["id"],int(match[1])))
             except Exception as error: self.send_json({"error":str(error)},400)
+        elif user and vag_match:
+            try: self.send_json(self.save_vag_update(self.read_json(),int(vag_match[1])))
+            except Exception as error: self.send_json({"error":str(error)},400)
 
     def do_DELETE(self):
-        match = re.fullmatch(r"/api/records/(\d+)", urlparse(self.path).path); user=self.require_admin()
+        path=urlparse(self.path).path; match = re.fullmatch(r"/api/records/(\d+)", path); vag_match = re.fullmatch(r"/api/vag-updates/(\d+)", path); user=self.require_admin()
         if user and match:
             with db() as c: c.execute("DELETE FROM records WHERE id=?",(match[1],)); c.execute("DELETE FROM favorites WHERE record_id=?",(match[1],)); c.execute("DELETE FROM attachments WHERE record_id=?",(match[1],)); c.execute("DELETE FROM history WHERE record_id=?",(match[1],))
+            self.send_json({"ok":True})
+        elif user and vag_match:
+            with db() as c: c.execute("DELETE FROM vag_attachments WHERE vag_update_id=?",(vag_match[1],)); c.execute("DELETE FROM vag_updates WHERE id=?",(vag_match[1],))
             self.send_json({"ok":True})
 
 if __name__ == "__main__":
