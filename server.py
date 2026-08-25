@@ -197,7 +197,8 @@ class Handler(SimpleHTTPRequestHandler):
                         except (ValueError, sqlite3.IntegrityError): pass
                 self.get_records()
             elif path == "/api/records":
-                self.send_json(self.save_record(self.read_json(), None), 201)
+                user = self.require_user()
+                if user: self.send_json(self.save_record(self.read_json(), user["id"]), 201)
             elif path == "/api/vag-updates":
                 if self.require_admin(): self.send_json(self.save_vag_update(self.read_json()), 201)
             elif (match := re.fullmatch(r"/api/records/(\d+)/favorite", path)):
