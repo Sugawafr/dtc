@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parent
 DB = ROOT / "dtc.db"
 UPLOADS = ROOT / "uploads"
 PORT = int(os.environ.get("DTC_PORT", "4180"))
+DEALER_CODE = os.environ.get("DTC_DEALER_CODE", "")
 
 def db():
     conn = sqlite3.connect(DB)
@@ -160,7 +161,19 @@ class Handler(SimpleHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
         try:
-            if path in ("/api/register", "/api/login"):
+            if path == "/api/dealer-login":
+                code = str(self.read_json().get("code", "")).strip()
+                if not DEALER_CODE: raise ValueError("Le code concession n’est pas configuré sur le serveur.")
+                if not secrets.compare_digest(code, DEALER_CODE): raise ValueError("Code concession incorrect.")
+                with db() as c:
+                    shared = c.execute("SELECT id FROM users WHERE email='concession@local'").fetchone()
+                    if shared: uid = shared["id"]
+                    else:
+                        cur = c.execute("INSERT INTO users(email,password,is_admin,created_at) VALUES(?,?,1,?)", ("concession@local",password_hash(secrets.token_urlsafe(32)),int(time.time())))
+                        uid = cur.lastrowid
+                    token = secrets.token_urlsafe(32); c.execute("INSERT INTO sessions(token,user_id,expires_at) VALUES(?,?,?)", (token,uid,int(time.time())+2592000))
+                self.send_json({"id":uid,"email":"Concession","is_admin":True}, cookie=f"dtc_session={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000")
+            elif path in ("/api/register", "/api/login"):
                 data = self.read_json(); email = data.get("email", "").strip().lower(); password = data.get("password", "")
                 if "@" not in email or len(password) < 8: raise ValueError("Utilisez un e-mail valide et un mot de passe d’au moins 8 caractères.")
                 with db() as c:
